@@ -9,6 +9,7 @@ from sqlalchemy import func
 from marshmallow import Schema, fields, ValidationError, validate, validates
 from password_strength import PasswordPolicy
 from werkzeug.security import generate_password_hash
+from marshmallow_enum import EnumField
 
 app = Flask(__name__)
 
@@ -92,12 +93,36 @@ class BaseUserSchema(Schema):
             raise ValidationError("Name must be two separate words")
 
 
+users_clothes = db.Table(
+    "users_clothes",
+    db.Model.metadata,
+    db.Column("user_id", db.Integer, db.ForeignKey("user.id")),
+    db.Column("clothes_id", db.Integer, db.ForeignKey("clothes.id")),
+)
+
+
 class UserSignInSchema(BaseUserSchema):
     password = fields.String(required=True, validate=validate.And(validate.Length(min=8, max=20), validate_password))
 
 
-class UserOutShema(BaseUserSchema):
+class UserOutSchema(BaseUserSchema):
     id = fields.Integer()
+
+
+class SingleClothSchemaBase(Schema):
+    name = fields.String(required=True)
+    color = EnumField(ColorEnum, by_value=True)
+    size = EnumField(SizeEnum, by_value=True)
+
+
+class SingleClothSchemaIn(SingleClothSchemaBase):
+    photo = fields.String(required=True)
+
+
+class SingleClothSchemaOut(SingleClothSchemaBase):
+    id = fields.Integer()
+    create_on = fields.DateTime()
+    updated_on = fields.DateTime()
 
 
 class UserRegisterResource(Resource):
@@ -109,14 +134,33 @@ class UserRegisterResource(Resource):
         if not errors:
             data['password'] = generate_password_hash(data['password'], method='sha256')
             new_user = User(**data)
-            db.session.add(User(**data))
+            db.session.add(new_user)
             db.session.commit()
-            result = UserOutShema().dump(new_user)
-            return result
+            return UserOutSchema().dump(new_user)
         return errors
 
 
+class UserResource(Resource):
+    def get(self, pk):
+        user = User.query.filter_by(id=pk).first()
+        return UserOutSchema().dump(user)
+
+
+class ClothesResource(Resource):
+    def post(self):
+        data = request.get_json()
+        schema = SingleClothSchemaIn()
+        errors = schema.validate(data)
+        if errors:
+            return errors
+        new_clothes = Clothes(**data)
+        db.session.add(new_clothes)
+        db.session.commit()
+        return SingleClothSchemaOut().dump(new_clothes)
+
+
 api.add_resource(UserRegisterResource, '/register')
+api.add_resource(ClothesResource, '/clothes')
 
 if __name__ == "__main__":
     app.run(debug=True)
