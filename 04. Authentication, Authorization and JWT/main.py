@@ -7,11 +7,14 @@ from flask import Flask, request
 from flask_migrate import Migrate
 from flask_restful import Api, Resource
 from flask_sqlalchemy import SQLAlchemy
+from jwt import DecodeError, InvalidSignatureError
 from sqlalchemy import func
 from marshmallow import Schema, fields, ValidationError, validate, validates
 from password_strength import PasswordPolicy
+from werkzeug.exceptions import BadRequest, InternalServerError, Forbidden
 from werkzeug.security import generate_password_hash
 from marshmallow_enum import EnumField
+from flask_httpauth import HTTPTokenAuth
 
 app = Flask(__name__)
 
@@ -21,6 +24,43 @@ app.config['SQLALCHEMY_DATABASE_URI'] = f"postgresql://{config('DB_USER')}:{conf
 db = SQLAlchemy(app)
 api = Api(app)
 migrate = Migrate(app, db)
+auth = HTTPTokenAuth(scheme='Bearer')
+
+
+@auth.verify_token
+def verify_token(token):
+    token_decoded_data = User.decode_token(token)
+    current_user = User.query.filter_by(id=token_decoded_data["sub"]).first()
+    return current_user
+
+
+def permission_reqiured(permissions_needed):
+    def decorated_func(func):
+        def wrapper(*args, **kwargs):
+            if auth.current_user().role in permissions_needed:
+                return func(*args, **kwargs)
+            raise Forbidden("You have no permission to access this resource.")
+        return wrapper
+    return decorated_func
+
+
+def validate_schema(schema_name):
+    def decorated_func(func):
+        def wrapper(*args, **kwargs):
+            schema = schema_name()
+            data = request.get_json()
+            errors = schema.validate(data)
+            if not errors:
+                return func(*args, **kwargs)
+            return BadRequest(errors)
+        return wrapper
+    return decorated_func
+
+
+class UserRolesEnum(enum.Enum):
+    super_admin = "super admin"
+    admin = "admin"
+    user = "user"
 
 
 class User(db.Model):
@@ -31,6 +71,7 @@ class User(db.Model):
     phone = db.Column(db.Text)
     create_on = db.Column(db.DateTime, server_default=func.now())
     updated_on = db.Column(db.DateTime, onupdate=func.now())
+    role = db.Column(db.Enum(UserRolesEnum), server_default=UserRolesEnum.user.name, nullable=False)
 
     def encode_token(self):
         try:
@@ -41,6 +82,15 @@ class User(db.Model):
             return jwt.encode(payload, key=config('SECRET_KEY'), algorithm='HS256')
         except Exception as e:
             raise e
+
+    @staticmethod
+    def decode_token(token):
+        try:
+            return jwt.decode(token, key=config('SECRET_KEY'), algorithms=['HS256'])
+        except (DecodeError, InvalidSignatureError) as ex:
+            raise BadRequest("Invalid or missing token")
+        except Exception:
+            raise InternalServerError("Something went wrong")
 
 
 class ColorEnum(enum.Enum):
@@ -138,18 +188,15 @@ class SingleClothSchemaOut(SingleClothSchemaBase):
 
 
 class UserRegisterResource(Resource):
+    @validate_schema(UserSignInSchema)
     def post(self):
         data = request.get_json()
-        schema = UserSignInSchema()
-        errors = schema.validate(data)
+        data['password'] = generate_password_hash(data['password'], method='sha256')
+        new_user = User(**data)
+        db.session.add(new_user)
+        db.session.commit()
+        return {"token": new_user.encode_token()}
 
-        if not errors:
-            data['password'] = generate_password_hash(data['password'], method='sha256')
-            new_user = User(**data)
-            db.session.add(new_user)
-            db.session.commit()
-            return {"token": new_user.encode_token()}
-        return errors
 
 
 class UserResource(Resource):
@@ -159,6 +206,8 @@ class UserResource(Resource):
 
 
 class ClothesResource(Resource):
+    @auth.login_required
+    @permission_reqiured([UserRolesEnum.user, UserRolesEnum.super_admin])
     def post(self):
         data = request.get_json()
         schema = SingleClothSchemaIn()
@@ -169,6 +218,12 @@ class ClothesResource(Resource):
         db.session.add(new_clothes)
         db.session.commit()
         return SingleClothSchemaOut().dump(new_clothes)
+
+    @auth.login_required
+    def get(self):
+        current_user = auth.current_user()
+        clothes = Clothes.query.all()
+        return {"data": clothes}, 200
 
 
 api.add_resource(UserRegisterResource, '/register')
